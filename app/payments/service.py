@@ -6,6 +6,8 @@ the balance changes. This is the only code that reads or writes `balance_cents` 
 request. It knows nothing about HTTP.
 """
 
+import hashlib
+import json
 import logging
 import threading
 from collections.abc import Callable
@@ -13,7 +15,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from psycopg import Connection
-from psycopg.errors import DeadlockDetected, LockNotAvailable
+from psycopg.errors import DeadlockDetected, LockNotAvailable, UniqueViolation
 from psycopg.rows import TupleRow
 from psycopg_pool import PoolTimeout
 
@@ -35,6 +37,15 @@ INSERT_PAYMENT = """
     VALUES (%s, %s, %s, %s)
     RETURNING id
 """
+FIND_KEY = """
+    SELECT fingerprint, payment_ids FROM idempotency_keys
+    WHERE payer_firm_id = %s AND key = %s
+"""
+INSERT_KEY = """
+    INSERT INTO idempotency_keys (payer_firm_id, key, fingerprint, payment_ids)
+    VALUES (%s, %s, %s, %s)
+"""
+KEY_CONSTRAINT = "idempotency_keys_pkey"
 APPLY_DELTA = "UPDATE firms SET balance_cents = balance_cents + %s WHERE id = %s"
 
 
@@ -51,6 +62,7 @@ class BulkPayment:
 
     payer_uuid: str
     payments: tuple[Payment, ...]
+    idempotency_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -60,9 +72,32 @@ class Executed:
 
 
 @dataclass(frozen=True)
+class Replayed:
+    """The request was executed earlier under the same key; nothing was applied now."""
+
+    payment_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class Denied:
-    code: Literal["self_payment", "unknown_firm", "request_denied"]
+    code: Literal["self_payment", "unknown_firm", "idempotency_key_reused", "request_denied"]
     unknown_firm_uuids: tuple[str, ...] = ()
+
+
+def fingerprint(request: BulkPayment) -> bytes:
+    """Hash of the payer and the payments in request order (ADR 0003).
+
+    The JSON is ASCII-escaped and built from lists, so no description can pass for the
+    boundary between two fields.
+    """
+    canonical = json.dumps(
+        [
+            request.payer_uuid,
+            [[p.payee_uuid, p.amount_cents, p.description] for p in request.payments],
+        ],
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("ascii")).digest()
 
 
 class Unavailable(Exception):
@@ -91,7 +126,7 @@ class PaymentService:
         with self._counter_lock:
             return self._deadlocks_detected
 
-    def execute(self, request: BulkPayment) -> Executed | Denied:
+    def execute(self, request: BulkPayment) -> Executed | Replayed | Denied:
         if any(payment.payee_uuid == request.payer_uuid for payment in request.payments):
             return Denied("self_payment")
 
@@ -102,6 +137,10 @@ class PaymentService:
                 with self._counter_lock:
                     self._deadlocks_detected += 1
                 logger.warning("deadlock on attempt %d of %d", attempt, self._max_attempts)
+            except UniqueViolation as error:
+                if error.diag.constraint_name != KEY_CONSTRAINT:
+                    raise
+                logger.warning("idempotency key inserted by another request, attempt %d", attempt)
             except LockNotAvailable:
                 logger.warning("lock timeout waiting for firm rows")
                 raise Unavailable("lock_timeout") from None
@@ -110,7 +149,7 @@ class PaymentService:
                 raise Unavailable("pool_exhausted") from None
         raise Unavailable("deadlock")
 
-    def _run(self, request: BulkPayment, attempt: int) -> Executed | Denied:
+    def _run(self, request: BulkPayment, attempt: int) -> Executed | Replayed | Denied:
         with self._pool.connection() as conn:
             conn.execute("SELECT set_config('lock_timeout', %s, true)", (self._lock_timeout,))
 
@@ -124,14 +163,24 @@ class PaymentService:
             if request.payer_uuid not in firms:
                 return Denied("unknown_firm", tuple(u for u in lock_uuids if u not in firms))
 
-            # Step 4: replay or idempotency_key_reused goes here (ADR 0003, #12). It must
-            # come after the lock query above and before the payee and funds checks below.
+            # Step 4: replay or idempotency_key_reused (ADR 0003). It must come after the
+            # lock query above, whose payer row keeps two requests with one key apart, and
+            # before the payee and funds checks below.
+            payer_id, balance = firms[request.payer_uuid]
+            key = request.idempotency_key
+            request_fingerprint = fingerprint(request) if key is not None else b""
+            if key is not None:
+                stored = conn.execute(FIND_KEY, (payer_id, key)).fetchone()
+                if stored:
+                    stored_fingerprint, stored_ids = stored
+                    if bytes(stored_fingerprint) != request_fingerprint:
+                        return Denied("idempotency_key_reused")
+                    return Replayed(tuple(stored_ids))
 
             unknown_payees = tuple(u for u in payee_uuids if u not in firms)
             if unknown_payees:
                 return Denied("unknown_firm", unknown_payees)
 
-            payer_id, balance = firms[request.payer_uuid]
             total = sum(payment.amount_cents for payment in request.payments)
             if balance < total:
                 logger.info(
@@ -143,6 +192,8 @@ class PaymentService:
                 return Denied("request_denied")
 
             payment_ids = self._write(conn, request, payer_id, total, firms)
+            if key is not None:
+                conn.execute(INSERT_KEY, (payer_id, key, request_fingerprint, list(payment_ids)))
             if self.fault:
                 self.fault(attempt)
             return Executed(payment_ids)

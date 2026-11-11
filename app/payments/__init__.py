@@ -4,7 +4,16 @@ from app.payments.service import (
     Executed,
     Payment,
     PaymentService,
+    Replayed,
     Unavailable,
 )
 
-__all__ = ["BulkPayment", "Denied", "Executed", "Payment", "PaymentService", "Unavailable"]
+__all__ = [
+    "BulkPayment",
+    "Denied",
+    "Executed",
+    "Payment",
+    "PaymentService",
+    "Replayed",
+    "Unavailable",
+]

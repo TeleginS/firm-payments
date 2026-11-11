@@ -47,4 +47,11 @@ def balances(db: Conn) -> list[tuple[int, int]]:
 def assert_nothing_written(db: Conn) -> None:
     count = db.execute("SELECT count(*) FROM payments").fetchone()
     assert count == (0,)
+    assert key_count(db) == 0
     assert balances(db) == SEED
+
+
+def key_count(db: Conn) -> int:
+    row = db.execute("SELECT count(*) FROM idempotency_keys").fetchone()
+    assert row
+    return int(row[0])
