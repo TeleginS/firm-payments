@@ -20,5 +20,6 @@ def create_pool(settings: Settings) -> Pool:
         max_size=settings.pool_size,
         timeout=settings.pool_timeout_seconds,
         configure=_read_committed,
+        check=ConnectionPool.check_connection,
         open=False,
     )

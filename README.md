@@ -153,6 +153,11 @@ All of the money logic sits in one function that holds one transaction
    `lock_timeout` is set with `set_config(..., true)` inside the transaction, never with
    `SET` on a pooled connection, so it can't leak into another request. A wait that
    exceeds it is `503` `lock_timeout`; no free connection is `503` `pool_exhausted`.
+   The pool tests a connection when it hands it out, so after a database restart the dead
+   ones are replaced before a request uses them, not one failed request each. That check
+   happens before anything is sent, so it is safe. A connection lost *during* a
+   transaction is deliberately not retried or mapped to `503`: after `COMMIT` the payment
+   may have been applied, and until #12 a retry could pay twice. It stays a `500`.
 7. **Correlation.** A middleware echoes a usable `X-Correlation-Id` or generates one, and
    a log record factory stamps it on every line, including the access line the app writes
    itself (uvicorn's access log is off).
