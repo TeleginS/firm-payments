@@ -31,18 +31,21 @@
 
 ## Layout
 
-No code yet. Planned:
+Tooling exists; the service itself doesn't yet (`app/main.py` has only `/healthz`).
 
 ```
 app/            # FastAPI app, routes, schemas, service, db
 tests/          # pytest, including concurrency tests against real Postgres
-migrations/     # schema.sql + seed.sql, loaded by the Postgres container; no migration tool
-docker-compose.yml
-Makefile
+migrations/     # schema.sql, seed.sql, reset.sql; loaded by the Postgres container; no migration tool
+deploy/         # nginx.conf (load balancer) and initdb/ (creates firm_payments_test)
+scripts/        # sample-request.sh: the brief's sample request
+docker-compose.yml  # db, app (2 replicas), lb (nginx on :8000)
+Dockerfile
+Makefile        # `make help` lists every target
 ```
 
-- **Source**: `app/` (planned)
-- **Tests**: `tests/` (planned)
+- **Source**: `app/`
+- **Tests**: `tests/`
 - **Resources / assets**: `migrations/` for schema and the three-firm seed from the brief.
   The schema keeps the brief's columns, adds constraints, widens the cents columns to
   `BIGINT`, and adds one `idempotency_keys` table (ADR 0003).
@@ -52,17 +55,17 @@ Makefile
 
 ## Verification command
 
-None yet. Adding it is the first improvement worth making. Planned:
-
 ```bash
-make verify         # ruff + mypy + pytest against dockerized Postgres
-make verify-full    # plus the multi-process concurrency test and the sample-request smoke test
+make verify         # ruff + mypy --strict + pytest against dockerized Postgres
+make verify-full    # (planned) plus the multi-process concurrency test and the sample-request smoke test
 ```
 
-- **What it enforces**: lint, types, unit + integration tests (planned)
-- **Healthy output**: (fill in once it exists)
-- **Typical duration**: (fill in once it exists; target < 1 minute)
-- **QA variant**: `make verify-full`
+- **What it enforces**: ruff lint and format check, mypy strict on `app/` and `tests/`,
+  pytest. Starts the `db` container and creates `firm_payments_test` if missing.
+- **Healthy output**: ends with `N passed` from pytest and exit code 0
+- **Typical duration**: under 10 seconds once the image and `.venv` exist
+- **QA variant**: `make verify-full` (planned; until it exists, `make verify` plus
+  `make seed && make sample` against `make up`)
 - **Time budget**: 15 minutes
 - **Base-version checks**: `git worktree add` at the base commit and run only the failing
   tests there
@@ -72,24 +75,28 @@ make verify-full    # plus the multi-process concurrency test and the sample-req
 ## Commands
 
 ```bash
-# Start database
-docker compose up -d db
+# Install dependencies
+make install                 # uv sync
 
-# Run service
-uvicorn app.main:app --reload
+# Start database only / the whole stack (db + 2 app replicas + nginx on :8000)
+make db
+make up
+
+# Run one instance locally with reload
+make run
 
 # Test — the mandatory QA gate
-pytest
+make verify                  # or: make test / make lint / make typecheck
 
-# Lint / format
-ruff check . && ruff format --check .
+# Reload the brief's three firms without touching the schema
+make seed
 
 # Recreate the database from schema.sql + seed.sql (deletes the data volume).
 # Postgres loads those files only into an empty volume.
 make reset-db
 ```
 
-- **Required prefix or environment**: `DATABASE_URL` (see `.env.example` once it exists)
+- **Required prefix or environment**: `DATABASE_URL` and `TEST_DATABASE_URL`; the Makefile exports defaults (see `.env.example`)
 - **Known-bad invocations**: tests run against SQLite. They hide every locking and
   isolation bug this service exists to get right. Always use Postgres.
 
@@ -121,7 +128,7 @@ make reset-db
 - **Correlation**: every response carries `X-Correlation-Id` and every log line for the
   request carries the same value. The real cause of a `request_denied` goes to the log,
   never to the response.
-- **Does NOT exist**: everything. No code has been written yet.
+- **Does NOT exist**: the service. Only the tooling, the schema and `/healthz` exist.
 
 ## Critical flags and release gates
 
