@@ -70,7 +70,11 @@ def wait_until_queued(db: Conn, count: int) -> None:
 
 
 def fire(
-    client: TestClient, bodies: list[bytes], settings: Settings, while_in_flight: Callable[[], None]
+    client: TestClient,
+    bodies: list[bytes],
+    settings: Settings,
+    while_in_flight: Callable[[], None],
+    **headers: str,
 ) -> list[Response]:
     """Sends every body from its own thread, released together by a barrier.
 
@@ -84,7 +88,7 @@ def fire(
     def send(index: int) -> None:
         try:
             barrier.wait(timeout=10)
-            responses[index] = post(client, bodies[index])
+            responses[index] = post(client, bodies[index], **headers)
         except BaseException as error:
             failures.append(error)
 

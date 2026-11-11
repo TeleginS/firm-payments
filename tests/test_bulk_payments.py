@@ -94,19 +94,6 @@ def test_a_bad_idempotency_key_is_a_400_and_writes_nothing(
     assert_nothing_written(db)
 
 
-def test_a_valid_idempotency_key_is_accepted_and_ignored_until_adr_0003(
-    client: TestClient, db: Conn
-) -> None:
-    # ADR 0003 (#12) will make the second request a replay. Until then a key protects nothing.
-    first = post(client, SAMPLE, **{"Idempotency-Key": "sample-1"})
-    second = post(client, SAMPLE, **{"Idempotency-Key": "sample-1"})
-
-    assert first.json() == {"payment_ids": [1, 2, 3]}
-    assert second.json() == {"payment_ids": [4, 5, 6]}
-    assert "Idempotent-Replayed" not in second.headers
-    assert balances(db)[0] == (1, 5_000_000 - 2 * 1_325_125)
-
-
 def test_a_self_payment_is_a_422(client: TestClient, db: Conn) -> None:
     response = post(client, request_body(payments=[payment(NAIR), payment(PINECREST)]))
 
