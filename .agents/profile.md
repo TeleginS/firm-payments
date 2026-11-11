@@ -3,8 +3,8 @@
 > **Precedence: observed code > this profile > the role prompts.** Agents follow the code
 > when this file is wrong, and report the drift. Fix it when they do.
 >
-> Written before any code existed. Every "planned" item below is a target, not a fact:
-> once the code lands, the code wins.
+> Written before any code existed and updated when the bulk payment endpoint landed
+> (#3). Where it still says "planned", that is a target, not a fact.
 
 ## Identity
 
@@ -17,28 +17,30 @@
 
 ## Stack
 
-- **Language / runtime**: Python 3.12+ (planned)
-- **Framework**: FastAPI (planned)
+- **Language / runtime**: Python 3.12+
+- **Framework**: FastAPI
 - **Minimum platform / target**: Linux/macOS server, several load-balanced instances in
   front of one PostgreSQL database
 - **Architecture pattern**: thin HTTP layer → service function holding the transaction →
   SQL. No ORM-level magic around the money path.
 - **Key dependencies**: FastAPI, psycopg 3 with `psycopg_pool` (plain SQL, no ORM,
-  synchronous handlers), PostgreSQL 16 via docker compose, pytest, `uv`. Prefer commonly
+  synchronous handlers), pydantic for request parsing, PostgreSQL 16 via docker compose,
+  pytest, `uv`. Prefer commonly
   used libraries (the brief requires it).
 - **Decisions**: `docs/adr/` (0001 locking, 0002 status codes, 0003 idempotency).
   Vocabulary: `GLOSSARY.md`.
 
 ## Layout
 
-Tooling exists; the service itself doesn't yet (`app/main.py` has only `/healthz`).
-
 ```
-app/            # FastAPI app, routes, schemas, service, db
+app/            # main.py (create_app, lifespan), db.py (pool), settings.py, correlation.py
+app/api/        # routes.py (POST /bulk_payments), schemas.py (parsing, Malformed), errors.py
+app/payments/   # service.py: the single decision point for a bulk payment request
 tests/          # pytest, including concurrency tests against real Postgres
+tests/two_process/  # marked two_process; run by make verify-full
 migrations/     # schema.sql, seed.sql, reset.sql; loaded by the Postgres container; no migration tool
 deploy/         # nginx.conf (load balancer) and initdb/ (creates firm_payments_test)
-scripts/        # sample-request.sh: the brief's sample request
+scripts/        # sample-request.sh (the brief's sample request), smoke.sh (checks its answer)
 docker-compose.yml  # db, app (2 replicas), lb (nginx on :8000)
 Dockerfile
 Makefile        # `make help` lists every target
@@ -57,15 +59,15 @@ Makefile        # `make help` lists every target
 
 ```bash
 make verify         # ruff + mypy --strict + pytest against dockerized Postgres
-make verify-full    # (planned) plus the multi-process concurrency test and the sample-request smoke test
+make verify-full    # verify, then the two-process concurrency test, then the sample-request smoke (re-seeds firm_payments)
 ```
 
 - **What it enforces**: ruff lint and format check, mypy strict on `app/` and `tests/`,
   pytest. Starts the `db` container and creates `firm_payments_test` if missing.
 - **Healthy output**: ends with `N passed` from pytest and exit code 0
 - **Typical duration**: under 10 seconds once the image and `.venv` exist
-- **QA variant**: `make verify-full` (planned; until it exists, `make verify` plus
-  `make seed && make sample` against `make up`)
+- **QA variant**: `make verify-full` (about half a minute; rebuilds the Docker stack and
+  re-seeds the service database `firm_payments`)
 - **Time budget**: 15 minutes
 - **Base-version checks**: `git worktree add` at the base commit and run only the failing
   tests there
@@ -102,8 +104,8 @@ make reset-db
 
 ## Architecture invariants
 
-- **Core modules**: (planned) `app/api` (HTTP + validation), `app/payments` (bulk
-  payment service), `app/db` (engine, sessions, schema)
+- **Core modules**: `app/api` (HTTP + validation), `app/payments` (bulk payment
+  service), `app/db.py` (pool), `app/correlation.py` (middleware + log stamping)
 - **Single decision points**: the funds check and the balance updates for a bulk
   request happen in exactly one function, inside one database transaction. Nothing
   else touches `balance_cents`.
@@ -128,7 +130,10 @@ make reset-db
 - **Correlation**: every response carries `X-Correlation-Id` and every log line for the
   request carries the same value. The real cause of a `request_denied` goes to the log,
   never to the response.
-- **Does NOT exist**: the service. Only the tooling, the schema and `/healthz` exist.
+- **Does NOT exist**: the `Idempotency-Key` behaviour (ADR 0003, follow-up #12). Until
+  then a valid key is accepted and ignored, a bad one is `400`, and the service marks
+  the step 4 slot of the order of checks in `app/payments/service.py`. The
+  `idempotency_keys` table exists and nothing writes to it.
 
 ## Critical flags and release gates
 
@@ -177,7 +182,8 @@ None. API only, English.
 
 ## Required tests
 
-Agreed during design. All run against real Postgres.
+Agreed during design. All run against real Postgres. The Idempotency items and the
+unique-violation retry belong to #12 and are not written yet.
 
 - **Format**: the amount grammar, including refusal of `"٣٠٠"`, `"１۲۰۰"` and `"300\n"`;
   a description of only spaces, tabs, carriage returns or newlines; an idempotency key
