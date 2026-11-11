@@ -9,6 +9,7 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "psycopg[binary]>=3.2",
     "psycopg-pool>=3.2",
+    "pydantic>=2.7",
 ]
 
 [dependency-groups]
@@ -39,4 +40,6 @@ files = ["app", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+# The two-process test starts servers and takes a few seconds: `make verify-full` runs it.
+addopts = "-ra -m 'not two_process'"
+markers = ["two_process: runs two service processes against one database (make verify-full)"]

@@ -3,7 +3,7 @@
 # and leaves Pinecrest at $36,748.75, Lopez at $1,700.75 and Nair at $14,050.50.
 #
 # Usage: scripts/sample-request.sh [base_url]   (default http://localhost:8000)
-# Extra curl options can follow, e.g. -H 'Idempotency-Key: sample-1'.
+# Extra curl options can follow, e.g. -H 'X-Correlation-Id: sample-1'.
 set -euo pipefail
 
 base_url="${1:-http://localhost:8000}"
