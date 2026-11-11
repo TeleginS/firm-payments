@@ -27,11 +27,20 @@ the application process.
 | Language | Python 3.12+ |
 | Web framework | FastAPI |
 | Database | PostgreSQL 16 (Docker Compose) |
+| Data access | psycopg 3, plain SQL, no ORM |
 | Tests | pytest, run against real Postgres |
 
 ## API
 
-### `POST /bulk_payments` _(path TBD)_
+### `POST /bulk_payments`
+
+An optional `Idempotency-Key` header (1 to 255 visible ASCII characters, no spaces)
+makes a retry safe: a request that was already executed under that key is not executed
+again.
+
+Every response carries an `X-Correlation-Id` header, and the service writes the same
+value on every log line for that request. Send your own (1 to 128 visible ASCII
+characters) and it is echoed; otherwise the service generates one.
 
 ```json
 {
@@ -48,16 +57,38 @@ the application process.
 
 | Field | Rules |
 |---|---|
-| `payer_firm_uuid` | Public UUID of the paying firm (`firms.uuid`) |
-| `payments[].amount` | US dollars as a string, positive, at most 2 decimal places (`"300"`, `"5800.5"`, `"1200.75"`) |
-| `payments[].payee_firm_uuid` | Public UUID of the receiving firm |
-| `payments[].description` | Free text |
+| `payer_firm_uuid` | Public UUID of the payer (`firms.uuid`), hyphenated form, any letter case |
+| `payments` | 1 to 1,000 entries. The same payee may appear more than once |
+| `payments[].amount` | US dollars as a string that is exactly `[0-9]{1,10}(\.[0-9]{1,2})?`, above zero (`"300"`, `"5800.5"`, `"1200.75"`). ASCII digits only |
+| `payments[].payee_firm_uuid` | Public UUID of the payee. It can't be the payer |
+| `payments[].description` | 1 to 1,000 characters, not only whitespace, stored exactly as sent |
+
+Fields the format doesn't define are refused.
 
 | Response | When |
 |---|---|
-| `201 Created` | The payments are recorded and the balances are updated |
-| `422 Unprocessable Entity` | The payer's balance doesn't cover the request total, so nothing is written |
-| _TBD_ | Malformed input, unknown firm UUIDs (see [Assumptions](#assumptions)) |
+| `201 Created` | **Executed.** The payments are recorded and the balances are updated. Body: `{"payment_ids": [...]}`. The ids are positional: the n-th id belongs to the n-th entry of `payments`. A replay under the same key returns the same body with `Idempotent-Replayed: true` |
+| `400 Bad Request` | **Malformed.** The request breaks the format above. Nothing is written |
+| `422 Unprocessable Entity` | **Denied.** The request is well-formed and the platform refuses it. Nothing is written |
+| `503 Service Unavailable` | The service couldn't get its row locks or a database connection in time. Nothing is written; retry after `Retry-After`. Codes: `lock_timeout`, `deadlock`, `pool_exhausted` |
+
+Every refusal body is `{"error": {"code": "...", "message": "..."}}`. The `422` codes:
+
+| Code | Meaning |
+|---|---|
+| `self_payment` | A payment names the payer as its payee |
+| `unknown_firm` | A firm UUID isn't on the platform. The body lists which |
+| `idempotency_key_reused` | The key was already used for different content. The same payments in a different order count as different |
+| `request_denied` | The platform won't execute the request. Today that means the payer's balance is below the request total |
+
+A response carries one code, the first that applies: `self_payment`, then `unknown_firm`
+for the payer, then a replay or `idempotency_key_reused`, then `unknown_firm` for a
+payee, then `request_denied`. A replay is answered before the payees and the balance are
+checked, so an executed request keeps returning its original result.
+
+`request_denied` is neutral on purpose. The response never names the cause and never
+includes a balance, because the service has no authentication. See
+[ADR 0002](docs/adr/0002-malformed-400-denied-422.md).
 
 ### Data model
 
@@ -72,6 +103,14 @@ payments (id INTEGER, payer_firm_id INTEGER, payee_firm_id INTEGER,
 Requests use firm **UUIDs**. The tables store internal integer **ids**. Money is stored
 and computed as **integer cents**.
 
+The service keeps the brief's columns and departs from the printed schema in three ways:
+
+- It adds constraints: primary and foreign keys, `UNIQUE (uuid)`,
+  `CHECK (balance_cents >= 0)` and `CHECK (amount_cents > 0)`.
+- It widens both cents columns to `BIGINT`. A 32-bit `INTEGER` tops out near $21.4M.
+- It adds one table, `idempotency_keys`
+  ([ADR 0003](docs/adr/0003-optional-idempotency-key.md)).
+
 ## Approach
 
 _TBD: fill in as the implementation lands._ The planned shape:
@@ -81,12 +120,13 @@ _TBD: fill in as the implementation lands._ The planned shape:
 2. **Resolve firms.** UUIDs are mapped to `firms.id`.
 3. **One transaction per request.** The funds check, the inserts into `payments` and
    every balance change commit together or not at all.
-4. **Concurrency control in the database.** _(Decision pending, to be recorded as an ADR.)_
-   - **Option A:** lock the payer and payee rows with `SELECT ... FOR UPDATE` in
-     ascending `id` order, so that two firms paying each other at once can't deadlock.
-   - **Option B:** debit with a conditional
-     `UPDATE firms SET balance_cents = balance_cents - :total WHERE id = :payer AND balance_cents >= :total`,
-     and deny the request when no row is updated.
+4. **Concurrency control in the database.** One query locks the payer and every payee
+   with `SELECT ... ORDER BY id FOR UPDATE` before the funds check, so two firms paying
+   each other at once can't deadlock. A deadlock is retried, and `lock_timeout` bounds
+   the wait. See [ADR 0001](docs/adr/0001-lock-firm-rows-in-id-order.md) for why this
+   beat a conditional `UPDATE` and `SERIALIZABLE`.
+5. **Safe retries.** With an `Idempotency-Key`, the key is stored in the same
+   transaction as the payments, and looked up after the locks are held.
 
 ## Issues I ran into
 
@@ -94,21 +134,34 @@ _TBD_
 
 ## Assumptions
 
-_TBD: confirm or revise each one during the implementation._
+Decided before the implementation; the terms are defined in [GLOSSARY.md](GLOSSARY.md).
 
-- An unknown payer or payee UUID is a client error, not a 422 "insufficient funds".
-  _(Status code TBD.)_
-- A request with an empty `payments` list is rejected.
+- A balance equal to the request total is enough. The payer ends at zero.
+- An unknown payer or payee denies the whole request (`422`, `unknown_firm`).
+- A firm can't pay itself (`422`, `self_payment`).
+- An empty `payments` list is malformed (`400`), and so is one with more than 1,000
+  entries.
 - The same payee may appear more than once in one request (the sample request does
-  this).
-- _Open:_ can a firm pay itself?
+  this). Each entry becomes its own payment.
+- One amount has at most 10 integer digits, so no request can overflow `BIGINT`.
+- Stored firm UUIDs are lower case, as in the seed. Request UUIDs are lower-cased before
+  lookup.
+- Only executed requests are remembered under an idempotency key. A denied request can
+  be sent again with the same key and is evaluated again.
+- Under one idempotency key, the same payments in a different order are a different
+  request. `payment_ids` are positional, so treating a reordered request as a replay
+  would hand back ids attached to the wrong payments
+  ([ADR 0003](docs/adr/0003-optional-idempotency-key.md)).
+- A firm's `uuid` could change after it was paid. A replay still returns its original
+  result.
 - No authentication or authorization. The brief doesn't cover it.
 
 ## Possible improvements
 
 _TBD._ Candidates:
 
-- An idempotency key, so a client retry doesn't apply the same request twice.
+- Authentication, so that only the payer can send its own requests.
+- Expiry for idempotency keys. They are kept forever today.
 - A ledger or double-entry model instead of mutable balances.
 - Audit fields (`created_at`, request id) on `payments`.
 
@@ -120,6 +173,10 @@ _TBD: commands get finalized together with the code._
 docker compose up -d db                 # Postgres with schema + seed
 uvicorn app.main:app --reload           # service on http://localhost:8000
 ```
+
+Postgres loads the schema and the seed only when its data volume is empty. After
+editing `schema.sql` or `seed.sql`, run `make reset-db`. It **deletes the data volume**
+and starts the database again from those files.
 
 The seed loads the three firms from the brief:
 
