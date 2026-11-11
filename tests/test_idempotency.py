@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 from psycopg.errors import UniqueViolation
 
+from app.payments.service import LOCK_FIRMS
 from app.settings import Settings
 from tests.conftest import LOPEZ, NAIR, PINECREST, Conn
 from tests.helpers import (
@@ -273,3 +274,26 @@ def test_the_error_names_a_constraint(db: Conn) -> None:
         )
 
     assert error.value.diag.constraint_name == "idempotency_keys_pkey"
+
+
+def test_the_lock_query_is_still_the_first_query_after_set_config_and_names_the_payer(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executed: list[tuple[str, object]] = []
+    original = psycopg.Connection.execute
+
+    def recording(self: Conn, query: object, params: object = None, **kwargs: object) -> object:
+        if str(query).strip():  # the pool's own health check sends an empty query
+            executed.append((str(query), params))
+        return original(self, query, params, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(psycopg.Connection, "execute", recording)
+
+    post(client, SAMPLE, **KEY)
+    post(client, SAMPLE, **KEY)
+
+    set_config, lock, after_lock, *_ = executed[:3]
+    assert "set_config" in set_config[0]
+    assert lock == (LOCK_FIRMS, ([PINECREST, NAIR, LOPEZ],))
+    assert "idempotency_keys" in after_lock[0]
+    assert [q for q, _ in executed].count(LOCK_FIRMS) == 2, "one lock query per request"
