@@ -64,7 +64,7 @@ characters) and it is echoed; otherwise the service generates one.
 | `payments` | 1 to 1,000 entries. The same payee may appear more than once |
 | `payments[].amount` | US dollars as a string that is exactly `[0-9]{1,10}(\.[0-9]{1,2})?`, above zero (`"300"`, `"5800.5"`, `"1200.75"`). ASCII digits only |
 | `payments[].payee_firm_uuid` | Public UUID of the payee. It can't be the payer |
-| `payments[].description` | 1 to 1,000 characters, not only whitespace, stored exactly as sent |
+| `payments[].description` | 1 to 1,000 characters, not only whitespace, no NUL character, stored exactly as sent |
 
 Fields the format doesn't define are refused.
 
@@ -208,7 +208,9 @@ Decided before the implementation; the terms are defined in [GLOSSARY.md](GLOSSA
 - A firm UUID is the hyphenated 8-4-4-4-12 form. Other forms `uuid.UUID` accepts (no
   hyphens, braces, `urn:uuid:`) are malformed.
 - A description is not "empty" if it holds any non-whitespace character; whitespace is
-  whatever Python's `str.strip()` strips. It is stored exactly as sent.
+  whatever Python's `str.strip()` strips. It is stored exactly as sent. A NUL character
+  (`\u0000`) is malformed because PostgreSQL text can't hold it; a lone surrogate
+  (`\ud800`) is malformed too, and the JSON parser already refuses it.
 - The body is read as JSON whatever its `Content-Type`.
 - No authentication or authorization. The brief doesn't cover it.
 

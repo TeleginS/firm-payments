@@ -44,6 +44,12 @@ def _not_blank(value: str) -> str:
     return value
 
 
+def _storable(value: str) -> str:
+    if "\x00" in value:
+        raise ValueError("must not contain a NUL character")
+    return value
+
+
 FirmUuid = Annotated[str, BeforeValidator(_firm_uuid)]
 
 
@@ -54,7 +60,12 @@ class _Strict(BaseModel):
 class PaymentRequest(_Strict):
     payee_firm_uuid: FirmUuid
     amount_cents: Annotated[int, BeforeValidator(_cents)] = Field(validation_alias="amount")
-    description: Annotated[str, Field(min_length=1, max_length=1000), AfterValidator(_not_blank)]
+    description: Annotated[
+        str,
+        Field(min_length=1, max_length=1000),
+        AfterValidator(_not_blank),
+        AfterValidator(_storable),
+    ]
 
 
 class BulkPaymentRequest(_Strict):
