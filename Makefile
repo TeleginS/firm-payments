@@ -39,7 +39,7 @@ db: ## Start Postgres only
 
 .PHONY: run
 run: db ## Run one app instance locally with reload on :8000 (APP_PORT) (stop the stack's app first)
-	uv run uvicorn app.main:app --reload --port $(APP_PORT)
+	uv run uvicorn app.main:app --reload --port $(APP_PORT) --no-access-log
 
 ##@ Database
 

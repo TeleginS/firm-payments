@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.correlation import CorrelationIdMiddleware, configure_logging
 from app.db import create_pool
 from app.settings import Settings
 
@@ -21,7 +22,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             pool.close()
 
+    configure_logging()
     app = FastAPI(title="Firm Payments", lifespan=lifespan)
+    app.add_middleware(CorrelationIdMiddleware)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
