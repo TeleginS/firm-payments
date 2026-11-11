@@ -167,18 +167,53 @@ _TBD._ Candidates:
 
 ## How to run
 
-_TBD: commands get finalized together with the code._
+Requirements: Docker with Compose v2, GNU Make, and [uv](https://docs.astral.sh/uv/)
+for the local workflow (uv installs Python 3.12 itself if it's missing). `make help`
+lists every target.
+
+### The whole stack in Docker
 
 ```bash
-docker compose up -d db                 # Postgres with schema + seed
-uvicorn app.main:app --reload           # service on http://localhost:8000
+make up
 ```
 
-Postgres loads the schema and the seed only when its data volume is empty. After
-editing `schema.sql` or `seed.sql`, run `make reset-db`. It **deletes the data volume**
-and starts the database again from those files.
+This builds the image and starts, in the shape the brief describes:
 
-The seed loads the three firms from the brief:
+- `db`: PostgreSQL 16 with the schema and the seed, on `localhost:5432`;
+- `app`: **two** instances of the service (`APP_REPLICAS`), sharing that database;
+- `lb`: nginx, round-robin across the instances, on `http://localhost:8000`.
+
+nginx never resends a `POST` to a second instance: a request that timed out may have
+committed, and only the client can decide to retry it (safely, with an
+`Idempotency-Key`). `make logs` follows every container; `make down` stops them and
+keeps the data.
+
+### One instance, locally, with reload
+
+```bash
+make install   # uv sync: creates .venv with the runtime and dev dependencies
+make run       # starts Postgres, then uvicorn --reload on http://localhost:8000
+```
+
+`make run` uses port 8000 too, so stop the Docker stack's app first (`make down`).
+
+### Database and seed
+
+| Target | What it does |
+|---|---|
+| `make seed` | Empties every table and loads the three firms again. Keeps the schema |
+| `make reset-db` | **Deletes the data volume** and recreates the database from `migrations/schema.sql` and `migrations/seed.sql`. Postgres loads those files only into an empty volume, so run this after editing them |
+| `make balances` | Prints every firm's balance |
+| `make psql` | Opens `psql` on the service database |
+
+The same Postgres also holds an empty `firm_payments_test` database for the tests,
+which apply the schema themselves.
+
+Ports and connection strings can be overridden from the environment; the defaults are in
+[`.env.example`](.env.example). If 5432 or 8000 is taken, run for example
+`POSTGRES_PORT=5433 APP_PORT=8001 make up`.
+
+The seed ([`migrations/seed.sql`](migrations/seed.sql)) is the brief's, verbatim:
 
 | id | Firm | Balance |
 |---|---|---|
@@ -189,6 +224,15 @@ The seed loads the three firms from the brief:
 ## How to verify
 
 ### Sample request (expects `201`)
+
+```bash
+make seed      # start from the brief's balances
+make sample    # sends the request below, then prints the balances
+```
+
+The script is [`scripts/sample-request.sh`](scripts/sample-request.sh); extra arguments
+go to `curl`, for example `scripts/sample-request.sh http://localhost:8000 -H 'Idempotency-Key: sample-1'`.
+The same request by hand:
 
 ```bash
 curl -i -X POST http://localhost:8000/bulk_payments \
@@ -213,12 +257,17 @@ The total is $13,251.25. Balances after the request:
 
 ### Tests
 
-_TBD._ Planned:
-
 ```bash
-make verify        # lint, types, unit and integration tests against Postgres
-make verify-full   # plus the concurrent-request test and the sample-request smoke test
+make verify    # ruff (lint + format check), mypy --strict, pytest against Postgres
 ```
+
+`make verify` starts Postgres if it isn't running. Tests always run against real
+Postgres, never SQLite, because the locking and isolation this service relies on only
+exist there. The pieces run on their own as `make lint`, `make typecheck` and
+`make test`; `make fmt` fixes what ruff can.
+
+_TBD:_ `make verify-full` adds the concurrent-request test across two service processes
+and the sample-request smoke test once the endpoint lands.
 
 ## How I worked
 

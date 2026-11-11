@@ -1,0 +1,52 @@
+name: firm-payments
+
+x-db-env: &db-env
+  POSTGRES_USER: firm_payments
+  POSTGRES_PASSWORD: firm_payments
+  POSTGRES_DB: firm_payments
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment: *db-env
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      # Run in name order, and only when the data volume is empty.
+      - ./deploy/initdb/00-test-database.sql:/docker-entrypoint-initdb.d/00-test-database.sql:ro
+      - ./migrations/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./migrations/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U firm_payments -d firm_payments"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://firm_payments:firm_payments@db:5432/firm_payments
+    depends_on:
+      db:
+        condition: service_healthy
+    deploy:
+      replicas: ${APP_REPLICAS:-2}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  lb:
+    image: nginx:1.27-alpine
+    ports:
+      - "${APP_PORT:-8000}:80"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  db-data:
