@@ -8,6 +8,7 @@ import psycopg
 import psycopg.conninfo
 import pytest
 from fastapi.testclient import TestClient
+from psycopg.rows import TupleRow
 
 from app.main import create_app
 from app.settings import Settings
@@ -19,7 +20,7 @@ PINECREST = "3f1c9a2e-7b4d-4c1e-9a55-2d8e6f0b7c41"
 LOPEZ = "8b2e4c71-0d3a-4f6e-b1c9-5a7d2e9f4c10"
 NAIR = "e5f18b3c-2a9d-4c07-8e6b-1d4a7f9c3b25"
 
-Conn = psycopg.Connection[tuple[object, ...]]
+Conn = psycopg.Connection[TupleRow]
 
 
 @pytest.fixture(scope="session")
@@ -40,7 +41,7 @@ def schema(test_database_url: str) -> None:
 
 
 def _balances(conn: Conn) -> list[int]:
-    return [row[0] for row in conn.execute("SELECT balance_cents FROM firms")]  # type: ignore[misc]
+    return [row[0] for row in conn.execute("SELECT balance_cents FROM firms")]
 
 
 @pytest.fixture
