@@ -5,6 +5,7 @@ from app.db import create_pool
 from app.main import create_app
 from app.settings import Settings
 from tests.conftest import LOPEZ, Conn
+from tests.helpers import post, request_body
 
 
 def test_healthz_needs_no_database() -> None:
@@ -67,3 +68,16 @@ def test_a_test_can_move_money_2(db: Conn) -> None:
     assert db.execute("SELECT balance_cents FROM firms WHERE id = 2").fetchone() == (50000,)
     db.execute("UPDATE firms SET balance_cents = balance_cents - 50000 WHERE uuid = %s", (LOPEZ,))
     db.execute("UPDATE firms SET balance_cents = balance_cents + 50000 WHERE id = 1")
+
+
+def test_a_pooled_connection_the_database_closed_is_replaced(client: TestClient, db: Conn) -> None:
+    """A database restart kills every pooled connection; requests after it must still succeed."""
+    assert post(client, request_body()).status_code == 201
+    db.execute(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity"
+        " WHERE datname = current_database() AND pid <> pg_backend_pid()"
+    )
+
+    statuses = [post(client, request_body()).status_code for _ in range(3)]
+
+    assert statuses == [201, 201, 201]
