@@ -34,12 +34,20 @@ the application process.
 
 ### `POST /bulk_payments`
 
-**Retries are not protected yet.** The optional `Idempotency-Key` header
-([ADR 0003](docs/adr/0003-optional-idempotency-key.md)) is the follow-up
-[#12](https://github.com/TeleginS/firm-payments/issues/12). Until it lands, the service
-checks the header's format (1 to 255 visible ASCII characters, no spaces; a bad key is
-`400`) and otherwise ignores it. A client that times out and sends the same bulk payment
-request again can pay everyone twice.
+**Safe retries.** Send an optional `Idempotency-Key` header (1 to 255 visible ASCII
+characters, no spaces; a bad key is `400`) and a request that was executed is never
+executed again under that key
+([ADR 0003](docs/adr/0003-optional-idempotency-key.md)). Sending the same request again
+returns the original `201` and the same `payment_ids` with `Idempotent-Replayed: true`,
+and applies nothing. The same key with different content is `422`
+`idempotency_key_reused`. A key belongs to one payer. Without the header there is no
+protection: a client that times out and sends the same request again can pay everyone
+twice.
+
+"The same content" is the payer and the payments **in request order**, compared after
+parsing: `"300"` and `"300.00"` match, UUID case doesn't matter, descriptions match byte
+for byte. The same payments in another order are a different request, because the ids
+are positional.
 
 Every response carries an `X-Correlation-Id` header, and the service writes the same
 value on every log line for that request. Send your own (1 to 128 visible ASCII
@@ -70,7 +78,7 @@ Fields the format doesn't define are refused.
 
 | Response | When |
 |---|---|
-| `201 Created` | **Executed.** The payments are recorded and the balances are updated. Body: `{"payment_ids": [...]}`. The ids are positional: the n-th id belongs to the n-th entry of `payments`. |
+| `201 Created` | **Executed.** The payments are recorded and the balances are updated. Body: `{"payment_ids": [...]}`. The ids are positional: the n-th id belongs to the n-th entry of `payments`. A replay of a request sent with an `Idempotency-Key` is also `201` with the original ids and the header `Idempotent-Replayed: true`; nothing is applied again. |
 | `400 Bad Request` | **Malformed.** The request breaks the format above, or carries a bad `Idempotency-Key`. Code `malformed_request`; the message names the field, never its value. Nothing is written |
 | `422 Unprocessable Entity` | **Denied.** The request is well-formed and the platform refuses it. Nothing is written |
 | `503 Service Unavailable` | The service couldn't get its row locks or a database connection in time. Nothing is written; retry after `Retry-After`. Codes: `lock_timeout`, `deadlock`, `pool_exhausted` |
@@ -82,12 +90,14 @@ Every refusal body is `{"error": {"code": "...", "message": "..."}}`. The `422` 
 |---|---|
 | `self_payment` | A payment names the payer as its payee |
 | `unknown_firm` | A firm UUID isn't on the platform. `error.unknown_firm_uuids` lists every missing one |
+| `idempotency_key_reused` | The `Idempotency-Key` was already used by this payer for a different request. Nothing is written |
 | `request_denied` | The platform won't execute the request. Today that means the payer's balance is below the request total |
 
 A response carries one code, the first that applies: `self_payment`, then `unknown_firm`
-for the payer, then `unknown_firm` for a payee, then `request_denied`. The service marks
-the place where ADR 0003 adds its replay check: after the payer is known and before the
-payees and the balance are looked at.
+for the payer, then (with a key that was used before) a replay or
+`idempotency_key_reused`, then `unknown_firm` for a payee, then `request_denied`. The
+replay check comes after the payer is known and before the payees and the balance are
+looked at, so a replay still succeeds after the payer's balance has dropped.
 
 Every `503` carries `Retry-After` (seconds), and the code says why: `lock_timeout` (a
 firm's row stayed locked past the lock timeout), `deadlock` (every attempt hit a
@@ -116,8 +126,9 @@ The service keeps the brief's columns and departs from the printed schema in thr
   `CHECK (balance_cents >= 0)` and `CHECK (amount_cents > 0)`.
 - It widens both cents columns to `BIGINT`. A 32-bit `INTEGER` tops out near $21.4M.
 - It adds one table, `idempotency_keys`
-  ([ADR 0003](docs/adr/0003-optional-idempotency-key.md)). It exists in the schema, and
-  nothing writes to it until #12.
+  ([ADR 0003](docs/adr/0003-optional-idempotency-key.md)). One row per executed
+  request that carried a key: payer, key, fingerprint and the payment ids, written in the
+  same transaction as the payments.
 
 ## Approach
 
@@ -142,14 +153,18 @@ All of the money logic sits in one function that holds one transaction
    ([ADR 0001](docs/adr/0001-lock-firm-rows-in-id-order.md)).
 4. **Evaluate its result in the order of checks**
    ([ADR 0002](docs/adr/0002-malformed-400-denied-422.md)): `self_payment` (no database
-   needed, so before a connection is taken), unknown payer, unknown payee, then the funds
-   check. A denial returns before anything is written.
+   needed, so before a connection is taken), unknown payer, the `Idempotency-Key` lookup,
+   unknown payee, then the funds check. A denial returns before anything is written.
 5. **Write.** One `payments` row per entry, in request order, with internal firm ids.
    Amounts are summed per payee, so each firm gets one `UPDATE` however often it is
-   named.
+   named. With a key, its row (payer, key, fingerprint, payment ids) is inserted in the
+   same transaction.
 6. **Deadlocks and waits.** Postgres sorts before it locks, but that is how the executor
    behaves rather than a promise, so a deadlock (`40P01`) rolls back and reruns the
-   transaction up to a bounded number of attempts, then answers `503` `deadlock`.
+   transaction up to a bounded number of attempts, then answers `503` `deadlock`. A
+   unique violation on the `idempotency_keys` primary key is rerun the same way, so the
+   next pass replays instead of failing; it can't happen while the lock query is whole,
+   and is the backstop for the day someone splits it. It is not counted as a deadlock.
    `lock_timeout` is set with `set_config(..., true)` inside the transaction, never with
    `SET` on a pooled connection, so it can't leak into another request. A wait that
    exceeds it is `503` `lock_timeout`; no free connection is `503` `pool_exhausted`.
@@ -157,11 +172,14 @@ All of the money logic sits in one function that holds one transaction
    ones are replaced before a request uses them, not one failed request each. That check
    happens before anything is sent, so it is safe. A connection lost *during* a
    transaction is deliberately not retried or mapped to `503`: after `COMMIT` the payment
-   may have been applied, and until #12 a retry could pay twice. It stays a `500`.
+   may have been applied, and only a client that sent an `Idempotency-Key` can retry it safely. It stays a `500`.
 7. **Correlation.** A middleware echoes a usable `X-Correlation-Id` or generates one, and
    a log record factory stamps it on every line, including the access line the app writes
    itself (uvicorn's access log is off).
-8. **Safe retries: not yet.** See the API section and #12.
+8. **Safe retries.** The `Idempotency-Key` lookup runs after the lock query, so two
+   requests with the same key wait on the same payer row: the second one sees the first
+   one's key and replays. No "in progress" state is needed
+   ([ADR 0003](docs/adr/0003-optional-idempotency-key.md)).
 
 ## Issues I ran into
 
@@ -200,7 +218,7 @@ Decided before the implementation; the terms are defined in [GLOSSARY.md](GLOSSA
 - One amount has at most 10 integer digits, so no request can overflow `BIGINT`.
 - Stored firm UUIDs are lower case, as in the seed. Request UUIDs are lower-cased before
   lookup.
-- Decided for the idempotency key, which #12 will build
+- Decided for the idempotency key
   ([ADR 0003](docs/adr/0003-optional-idempotency-key.md)):
   - only executed requests are remembered, so a denied request can be sent again with the
     same key and is evaluated again;
@@ -209,7 +227,7 @@ Decided before the implementation; the terms are defined in [GLOSSARY.md](GLOSSA
     payments;
   - a firm's `uuid` could change after it was paid, and a replay would still return its
     original result.
-- A valid `Idempotency-Key` is accepted and ignored until #12; a bad one is `400`.
+- Idempotency keys never expire.
 - A firm UUID is the hyphenated 8-4-4-4-12 form. Other forms `uuid.UUID` accepts (no
   hyphens, braces, `urn:uuid:`) are malformed.
 - A description is not "empty" if it holds any non-whitespace character; whitespace is
@@ -235,11 +253,8 @@ Implementation choices within the ADRs, read from the environment
 
 ## Possible improvements
 
-- **The `Idempotency-Key`** ([ADR 0003](docs/adr/0003-optional-idempotency-key.md),
-  [#12](https://github.com/TeleginS/firm-payments/issues/12)): replay protection for a
-  client that retries after a timeout. The first thing to build.
 - Authentication, so that only the payer can send its own requests.
-- Expiry for idempotency keys, once they exist.
+- Expiry for idempotency keys.
 - A ledger or double-entry model instead of mutable balances.
 - Audit fields (`created_at`, request id) on `payments`.
 - A metric for `deadlocks_detected` and the `503` codes; today they are log lines.
@@ -263,8 +278,8 @@ This builds the image and starts, in the shape the brief describes:
 - `lb`: nginx, round-robin across the instances, on `http://localhost:8000`.
 
 nginx never resends a `POST` to a second instance: a request that timed out may have
-committed, and only the client can decide to retry it (which is only safe once #12
-adds the `Idempotency-Key`). `make logs` follows every container; `make down` stops them and
+committed, and only the client can decide to retry it (which is only safe with an
+`Idempotency-Key`). `make logs` follows every container; `make down` stops them and
 keeps the data.
 
 ### One instance, locally, with reload

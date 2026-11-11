@@ -3,8 +3,8 @@
 > **Precedence: observed code > this profile > the role prompts.** Agents follow the code
 > when this file is wrong, and report the drift. Fix it when they do.
 >
-> Written before any code existed and updated when the bulk payment endpoint landed
-> (#3). Where it still says "planned", that is a target, not a fact.
+> Written before any code existed and updated when the bulk payment endpoint (#3) and
+> the idempotency key (#12) landed. Where it still says "planned", that is a target, not a fact.
 
 ## Identity
 
@@ -130,10 +130,8 @@ make reset-db
 - **Correlation**: every response carries `X-Correlation-Id` and every log line for the
   request carries the same value. The real cause of a `request_denied` goes to the log,
   never to the response.
-- **Does NOT exist**: the `Idempotency-Key` behaviour (ADR 0003, follow-up #12). Until
-  then a valid key is accepted and ignored, a bad one is `400`, and the service marks
-  the step 4 slot of the order of checks in `app/payments/service.py`. The
-  `idempotency_keys` table exists and nothing writes to it.
+- **Does NOT exist**: expiry of idempotency keys. ADR 0003 keeps them for ever; expiry is
+  a follow-up.
 
 ## Critical flags and release gates
 
@@ -183,7 +181,7 @@ None. API only, English.
 ## Required tests
 
 Agreed during design. All run against real Postgres. The Idempotency items and the
-unique-violation retry belong to #12 and are not written yet.
+unique-violation retry are in `tests/test_idempotency.py`.
 
 - **Format**: the amount grammar, including refusal of `"٣٠٠"`, `"１۲۰۰"` and `"300\n"`;
   a description of only spaces, tabs, carriage returns or newlines; an idempotency key
