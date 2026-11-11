@@ -66,6 +66,24 @@ def test_a_bad_description_is_malformed(description: object) -> None:
         parse_bulk_payment(body(payments=[payment(description=description)]))
 
 
+@pytest.mark.parametrize("escaped", [r"a\u0000b", r"\u0000", r"\ud800", r"x\udc00y", r"\ud83d"])
+def test_a_description_postgres_cannot_store_is_malformed(escaped: str) -> None:
+    raw = body(payments=[payment(description="PLACEHOLDER")]).replace(
+        b"PLACEHOLDER", escaped.encode()
+    )
+
+    with pytest.raises(Malformed):
+        parse_bulk_payment(raw)
+
+
+def test_a_surrogate_pair_description_parses() -> None:
+    raw = body(payments=[payment(description="PLACEHOLDER")]).replace(
+        b"PLACEHOLDER", rb"\ud83d\ude00"
+    )
+
+    assert parse_bulk_payment(raw).payments[0].description == "\U0001f600"
+
+
 def test_a_description_of_1000_characters_parses() -> None:
     parsed = parse_bulk_payment(body(payments=[payment(description="x" * 1000)]))
 

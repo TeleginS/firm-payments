@@ -65,6 +65,8 @@ MALFORMED = {
     "a zero amount": request_body(payments=[payment(amount="0.00")]),
     "Arabic-Indic digits": request_body(payments=[payment(amount="٣٠٠")]),
     "a blank description": request_body(payments=[payment(description=" \t\r\n")]),
+    "a NUL in the description": request_body(payments=[payment(description="a\u0000b")]),
+    "a lone surrogate in the description": request_body(payments=[payment(description="a\ud800b")]),
     "a UUID without hyphens": request_body(payer="3f1c9a2e7b4d4c1e9a552d8e6f0b7c41"),
     "a payee that is not a UUID": request_body(payments=[payment(payee="nobody")]),
 }
