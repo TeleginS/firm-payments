@@ -1,0 +1,12 @@
+{
+  "_comment": "FirmPayments gate config. Keys are documented in config.py. Source: agent-orchestration/gates/hooks/gates.example.json.",
+  "protected_branches": ["main", "master"],
+  "secret_names": [".env", ".env.*"],
+  "secret_allow": [".env.example", ".env.sample", ".env.template"],
+  "release_commands": [
+    {"command": "twine", "args": ["upload"]},
+    {"command": "docker", "args": ["push"]},
+    {"command": "gh", "args": ["release", "create"]}
+  ],
+  "allow_base_push": null
+}

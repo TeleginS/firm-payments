@@ -1,0 +1,3 @@
+[submodule "agent-orchestration"]
+	path = agent-orchestration
+	url = https://github.com/TeleginS/agent-orchestration.git

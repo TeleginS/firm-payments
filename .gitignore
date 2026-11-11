@@ -1,0 +1,8 @@
+.DS_Store
+# TaxDome assignment brief: copyrighted, kept local only
+/TA Firm Payments.pdf
+.claude/settings.local.json
+.env
+__pycache__/
+.venv/
+.pytest_cache/
