@@ -90,6 +90,25 @@ test: test-db ## Run the tests against Postgres
 .PHONY: verify
 verify: lint typecheck test ## Lint, types and tests: the gate before every push
 
+.PHONY: two-process
+two-process: test-db ## Run the test that sends concurrent requests to two service processes
+	uv run pytest -m two_process
+
+.PHONY: smoke
+smoke: ## Rebuild the stack, RE-SEED the service database (firm_payments), send the sample request and check the balances
+	@$(MAKE) --no-print-directory up
+	@$(MAKE) --no-print-directory seed
+	scripts/smoke.sh "http://localhost:$(APP_PORT)"
+
+.PHONY: verify-full
+verify-full: ## verify, then the two-process test, then the sample-request smoke (this RE-SEEDS firm_payments)
+	@$(MAKE) --no-print-directory verify
+	@echo "verify-full 1/3 PASS: make verify"
+	@$(MAKE) --no-print-directory two-process
+	@echo "verify-full 2/3 PASS: two-process test"
+	@$(MAKE) --no-print-directory smoke
+	@echo "verify-full 3/3 PASS: sample-request smoke"
+
 .PHONY: sample
 sample: ## Send the brief's sample request to :8000 (APP_PORT), then print the balances
 	scripts/sample-request.sh "http://localhost:$(APP_PORT)"
