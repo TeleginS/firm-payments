@@ -14,6 +14,10 @@ Default canonical labels: `needs-triage`, `needs-info`, `ready-for-agent`, `read
 
 Single-context: one `GLOSSARY.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
+### Session logs
+
+The brief requires the unedited log of every AI session. They live in `docs/ai-logs/`. Save or refresh the current session's log with `/save-session-log [slug]` (`.claude/skills/save-session-log`). Never write or edit a log by hand.
+
 ## Delivery pipeline
 
 This repo uses [agent-orchestration](https://github.com/TeleginS/agent-orchestration), vendored as the `agent-orchestration/` submodule. Start a task with `/orchestrator <task>`. Add `Mode: dry-run` to keep it off the tracker and the remote.
