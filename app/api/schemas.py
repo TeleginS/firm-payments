@@ -83,7 +83,7 @@ def parse_bulk_payment(body: bytes) -> BulkPaymentRequest:
 
 
 def parse_idempotency_key(value: str | None) -> str | None:
-    """The header's format only. Until ADR 0003 is implemented a valid key is not used."""
+    """The header's format (ADR 0003); a malformed key is Malformed, not ignored."""
     if value is not None and not IDEMPOTENCY_KEY.fullmatch(value):
         raise Malformed("Idempotency-Key: must be 1 to 255 visible ASCII characters, no spaces")
     return value
