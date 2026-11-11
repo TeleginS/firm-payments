@@ -1,8 +1,8 @@
 # Firm Payments: bulk payment service
 
 > **Status: work in progress.** This README follows the structure the brief asks for:
-> a pull-request description for teammates. Sections marked _TBD_ are filled in as the
-> work lands.
+> a pull-request description for teammates. Sections marked _TBD_ are the
+> author's to fill in.
 
 ## Summary
 
@@ -34,9 +34,12 @@ the application process.
 
 ### `POST /bulk_payments`
 
-An optional `Idempotency-Key` header (1 to 255 visible ASCII characters, no spaces)
-makes a retry safe: a request that was already executed under that key is not executed
-again.
+**Retries are not protected yet.** The optional `Idempotency-Key` header
+([ADR 0003](docs/adr/0003-optional-idempotency-key.md)) is the follow-up
+[#12](https://github.com/TeleginS/firm-payments/issues/12). Until it lands, the service
+checks the header's format (1 to 255 visible ASCII characters, no spaces; a bad key is
+`400`) and otherwise ignores it. A client that times out and sends the same bulk payment
+request again can pay everyone twice.
 
 Every response carries an `X-Correlation-Id` header, and the service writes the same
 value on every log line for that request. Send your own (1 to 128 visible ASCII
@@ -67,24 +70,28 @@ Fields the format doesn't define are refused.
 
 | Response | When |
 |---|---|
-| `201 Created` | **Executed.** The payments are recorded and the balances are updated. Body: `{"payment_ids": [...]}`. The ids are positional: the n-th id belongs to the n-th entry of `payments`. A replay under the same key returns the same body with `Idempotent-Replayed: true` |
-| `400 Bad Request` | **Malformed.** The request breaks the format above. Nothing is written |
+| `201 Created` | **Executed.** The payments are recorded and the balances are updated. Body: `{"payment_ids": [...]}`. The ids are positional: the n-th id belongs to the n-th entry of `payments`. |
+| `400 Bad Request` | **Malformed.** The request breaks the format above, or carries a bad `Idempotency-Key`. Code `malformed_request`; the message names the field, never its value. Nothing is written |
 | `422 Unprocessable Entity` | **Denied.** The request is well-formed and the platform refuses it. Nothing is written |
 | `503 Service Unavailable` | The service couldn't get its row locks or a database connection in time. Nothing is written; retry after `Retry-After`. Codes: `lock_timeout`, `deadlock`, `pool_exhausted` |
 
-Every refusal body is `{"error": {"code": "...", "message": "..."}}`. The `422` codes:
+Every refusal body is `{"error": {"code": "...", "message": "..."}}`. The `422` codes
+(`400` and `503` use the codes above):
 
 | Code | Meaning |
 |---|---|
 | `self_payment` | A payment names the payer as its payee |
-| `unknown_firm` | A firm UUID isn't on the platform. The body lists which |
-| `idempotency_key_reused` | The key was already used for different content. The same payments in a different order count as different |
+| `unknown_firm` | A firm UUID isn't on the platform. `error.unknown_firm_uuids` lists every missing one |
 | `request_denied` | The platform won't execute the request. Today that means the payer's balance is below the request total |
 
 A response carries one code, the first that applies: `self_payment`, then `unknown_firm`
-for the payer, then a replay or `idempotency_key_reused`, then `unknown_firm` for a
-payee, then `request_denied`. A replay is answered before the payees and the balance are
-checked, so an executed request keeps returning its original result.
+for the payer, then `unknown_firm` for a payee, then `request_denied`. The service marks
+the place where ADR 0003 adds its replay check: after the payer is known and before the
+payees and the balance are looked at.
+
+Every `503` carries `Retry-After` (seconds), and the code says why: `lock_timeout` (a
+firm's row stayed locked past the lock timeout), `deadlock` (every attempt hit a
+deadlock) or `pool_exhausted` (no database connection became free in time).
 
 `request_denied` is neutral on purpose. The response never names the cause and never
 includes a balance, because the service has no authentication. See
@@ -109,28 +116,70 @@ The service keeps the brief's columns and departs from the printed schema in thr
   `CHECK (balance_cents >= 0)` and `CHECK (amount_cents > 0)`.
 - It widens both cents columns to `BIGINT`. A 32-bit `INTEGER` tops out near $21.4M.
 - It adds one table, `idempotency_keys`
-  ([ADR 0003](docs/adr/0003-optional-idempotency-key.md)).
+  ([ADR 0003](docs/adr/0003-optional-idempotency-key.md)). It exists in the schema, and
+  nothing writes to it until #12.
 
 ## Approach
 
-_TBD: fill in as the implementation lands._ The planned shape:
+The handler is thin: parse, call the payment service, map the outcome to a status code.
+All of the money logic sits in one function that holds one transaction
+(`app/payments/service.py`).
 
-1. **Validate and normalize at the edge.** The service parses each `amount` string into
-   integer cents with a strict pattern. It never goes through a float.
-2. **Resolve firms.** UUIDs are mapped to `firms.id`.
-3. **One transaction per request.** The funds check, the inserts into `payments` and
-   every balance change commit together or not at all.
-4. **Concurrency control in the database.** One query locks the payer and every payee
-   with `SELECT ... ORDER BY id FOR UPDATE` before the funds check, so two firms paying
-   each other at once can't deadlock. A deadlock is retried, and `lock_timeout` bounds
-   the wait. See [ADR 0001](docs/adr/0001-lock-firm-rows-in-id-order.md) for why this
-   beat a conditional `UPDATE` and `SERIALIZABLE`.
-5. **Safe retries.** With an `Idempotency-Key`, the key is stored in the same
-   transaction as the payments, and looked up after the locks are held.
+1. **Parse at the edge** (`app/api/schemas.py`). The raw body goes through strict pydantic
+   models: unknown fields and wrong JSON types are refused at every level, UUIDs are
+   lower-cased, and each `amount` is matched against the grammar with `re.fullmatch` and
+   an explicit `[0-9]` class, then turned into integer cents. No float is involved.
+   Every violation is one `Malformed` error, mapped to `400`. FastAPI's own `422` for
+   validation never reaches a client.
+2. **One `READ COMMITTED` transaction per request.** The funds check, the inserts into
+   `payments` and every balance change commit together or not at all.
+3. **One ordered lock query.** `SELECT ... WHERE uuid = ANY(...) ORDER BY id FOR UPDATE`
+   locks the payer and every distinct payee before anything is checked, so two firms
+   paying each other at once take their locks in the same order. Under `READ COMMITTED`
+   the rows it returns are the latest committed versions, so the funds check sees the
+   current balance and nobody can change it before the commit. It stays one query, runs
+   first and always includes the payer
+   ([ADR 0001](docs/adr/0001-lock-firm-rows-in-id-order.md)).
+4. **Evaluate its result in the order of checks**
+   ([ADR 0002](docs/adr/0002-malformed-400-denied-422.md)): `self_payment` (no database
+   needed, so before a connection is taken), unknown payer, unknown payee, then the funds
+   check. A denial returns before anything is written.
+5. **Write.** One `payments` row per entry, in request order, with internal firm ids.
+   Amounts are summed per payee, so each firm gets one `UPDATE` however often it is
+   named.
+6. **Deadlocks and waits.** Postgres sorts before it locks, but that is how the executor
+   behaves rather than a promise, so a deadlock (`40P01`) rolls back and reruns the
+   transaction up to a bounded number of attempts, then answers `503` `deadlock`.
+   `lock_timeout` is set with `set_config(..., true)` inside the transaction, never with
+   `SET` on a pooled connection, so it can't leak into another request. A wait that
+   exceeds it is `503` `lock_timeout`; no free connection is `503` `pool_exhausted`.
+7. **Correlation.** A middleware echoes a usable `X-Correlation-Id` or generates one, and
+   a log record factory stamps it on every line, including the access line the app writes
+   itself (uvicorn's access log is off).
+8. **Safe retries: not yet.** See the API section and #12.
 
 ## Issues I ran into
 
-_TBD_
+- **The framework's default `422`.** FastAPI answers `422` when validation fails, which
+  is the status the brief gives to a payer who can't cover the total. The route takes the
+  raw body and parses it itself, so every format error is one `Malformed` and a typo can't
+  look like a denial.
+- **The correlation id on a `500`.** Starlette's error middleware sits outside user
+  middleware, so a handler for `Exception` runs after the request's context is gone, and
+  uvicorn then logs the traceback with no id. The correlation middleware turns an
+  unhandled exception into the `500` itself, inside the context, and writes the access
+  line itself because uvicorn's access line is written outside it.
+- **Reading ids back in order.** `INSERT ... RETURNING` through `executemany(...,
+  returning=True)` gives the ids in parameter order in one batch, which the positional
+  `payment_ids` need. Folding the rows into one multi-row `INSERT` would not promise the
+  order.
+- **A test that deadlocked itself.** My first overspend test released its lock only after
+  joining the request threads, so every request sat out the 10 s lock timeout. The lock is
+  now released from inside the run, once the requests are queued behind it.
+- **Proving the tests bite.** Removing `FOR UPDATE` makes the overspend test and the
+  two-process test fail, and locking in request order makes the mutual-payment test fail.
+  I checked each by hand before keeping the tests.
+- **`httpx2`.** The test client the installed Starlette expects is `httpx2`, not `httpx`.
 
 ## Assumptions
 
@@ -146,24 +195,47 @@ Decided before the implementation; the terms are defined in [GLOSSARY.md](GLOSSA
 - One amount has at most 10 integer digits, so no request can overflow `BIGINT`.
 - Stored firm UUIDs are lower case, as in the seed. Request UUIDs are lower-cased before
   lookup.
-- Only executed requests are remembered under an idempotency key. A denied request can
-  be sent again with the same key and is evaluated again.
-- Under one idempotency key, the same payments in a different order are a different
-  request. `payment_ids` are positional, so treating a reordered request as a replay
-  would hand back ids attached to the wrong payments
-  ([ADR 0003](docs/adr/0003-optional-idempotency-key.md)).
-- A firm's `uuid` could change after it was paid. A replay still returns its original
-  result.
+- Decided for the idempotency key, which #12 will build
+  ([ADR 0003](docs/adr/0003-optional-idempotency-key.md)):
+  - only executed requests are remembered, so a denied request can be sent again with the
+    same key and is evaluated again;
+  - the same payments in a different order are a different request, because `payment_ids`
+    are positional and a reordered replay would hand back ids attached to the wrong
+    payments;
+  - a firm's `uuid` could change after it was paid, and a replay would still return its
+    original result.
+- A valid `Idempotency-Key` is accepted and ignored until #12; a bad one is `400`.
+- A firm UUID is the hyphenated 8-4-4-4-12 form. Other forms `uuid.UUID` accepts (no
+  hyphens, braces, `urn:uuid:`) are malformed.
+- A description is not "empty" if it holds any non-whitespace character; whitespace is
+  whatever Python's `str.strip()` strips. It is stored exactly as sent.
+- The body is read as JSON whatever its `Content-Type`.
 - No authentication or authorization. The brief doesn't cover it.
+
+### Numeric settings
+
+Implementation choices within the ADRs, read from the environment
+([`app/settings.py`](app/settings.py), [`.env.example`](.env.example)):
+
+| Setting | Variable | Default | Why |
+|---|---|---|---|
+| Lock timeout | `LOCK_TIMEOUT_MS` | 3000 | A request never waits on a row lock for more than a few seconds |
+| Deadlock attempts | `DEADLOCK_MAX_ATTEMPTS` | 3 | One retry rarely meets the same conflict twice; three bounds the work |
+| `Retry-After` on a `503` | `RETRY_AFTER_SECONDS` | 1 | The causes pass in about a lock timeout or less |
+| Pool size, per process | `DB_POOL_SIZE` | 10 | Two instances use 20 of Postgres's 100 connections |
+| Wait for a connection | `DB_POOL_TIMEOUT_SECONDS` | 5 | Past this a request is `503` `pool_exhausted` rather than queued for ever |
+| Database | `DATABASE_URL` | none | Required |
 
 ## Possible improvements
 
-_TBD._ Candidates:
-
+- **The `Idempotency-Key`** ([ADR 0003](docs/adr/0003-optional-idempotency-key.md),
+  [#12](https://github.com/TeleginS/firm-payments/issues/12)): replay protection for a
+  client that retries after a timeout. The first thing to build.
 - Authentication, so that only the payer can send its own requests.
-- Expiry for idempotency keys. They are kept forever today.
+- Expiry for idempotency keys, once they exist.
 - A ledger or double-entry model instead of mutable balances.
 - Audit fields (`created_at`, request id) on `payments`.
+- A metric for `deadlocks_detected` and the `503` codes; today they are log lines.
 
 ## How to run
 
@@ -184,8 +256,8 @@ This builds the image and starts, in the shape the brief describes:
 - `lb`: nginx, round-robin across the instances, on `http://localhost:8000`.
 
 nginx never resends a `POST` to a second instance: a request that timed out may have
-committed, and only the client can decide to retry it (safely, with an
-`Idempotency-Key`). `make logs` follows every container; `make down` stops them and
+committed, and only the client can decide to retry it (which is only safe once #12
+adds the `Idempotency-Key`). `make logs` follows every container; `make down` stops them and
 keeps the data.
 
 ### One instance, locally, with reload
@@ -231,7 +303,7 @@ make sample    # sends the request below, then prints the balances
 ```
 
 The script is [`scripts/sample-request.sh`](scripts/sample-request.sh); extra arguments
-go to `curl`, for example `scripts/sample-request.sh http://localhost:8000 -H 'Idempotency-Key: sample-1'`.
+go to `curl`, for example `scripts/sample-request.sh http://localhost:8000 -H 'X-Correlation-Id: sample-1'`.
 The same request by hand:
 
 ```bash
@@ -266,8 +338,34 @@ Postgres, never SQLite, because the locking and isolation this service relies on
 exist there. The pieces run on their own as `make lint`, `make typecheck` and
 `make test`; `make fmt` fixes what ruff can.
 
-_TBD:_ `make verify-full` adds the concurrent-request test across two service processes
-and the sample-request smoke test once the endpoint lands.
+What the tests cover, all through the endpoint where it matters:
+
+- the amount grammar and every `400` case, and that a refusal writes nothing;
+- each `422` code and the neutral `request_denied` body;
+- concurrency: an overspend queued behind the payer's row lock, and two firms paying each
+  other in a loop. Threads start from a `threading.Barrier` and the pool is at least as
+  large as the thread count, so the requests contend in the database;
+- failure paths: a deadlock injected once (the request executes, the retry counter reads
+  1) and on every attempt (`503`), a held lock (`503` `lock_timeout`), and an exhausted
+  pool (`503` `pool_exhausted`);
+- after every database test, the sum of all balances is unchanged and none is negative.
+
+```bash
+make verify-full   # make verify, then the two parts below
+```
+
+`make verify-full` stops at the first failure and prints a pass line for each part:
+
+1. `make verify`.
+2. **Two-process test** (`make two-process`): starts two uvicorn processes, each with its
+   own pool, against the test database; sends 70 concurrent requests split across them;
+   stops them by PID; then checks that every answer is `201`, `422` or `503`, that the
+   balances equal the seed plus exactly the requests that answered `201`, and that none is
+   negative. It is marked `two_process`, so plain `make verify` skips it.
+3. **Sample smoke** (`make smoke`): rebuilds and starts the Docker stack, then **re-seeds
+   the service database `firm_payments`** (it empties every table), sends the brief's
+   sample request through the load balancer and fails unless the answer is `201` and the
+   balances are $36,748.75, $1,700.75 and $14,050.50.
 
 ## How I worked
 
