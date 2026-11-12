@@ -1,8 +1,14 @@
 # Firm Payments: bulk payment service
 
-> **Status: work in progress.** This README follows the structure the brief asks for:
-> a pull-request description for teammates. Sections marked _TBD_ are the
-> author's to fill in.
+> Written as the pull-request description the brief asks for. Jump to
+> [How to run](#how-to-run) and [How to verify](#how-to-verify) to try it, or read on
+> for the design.
+
+**Contents:** [Summary](#summary) · [API](#api) · [Data model](#data-model) ·
+[Approach](#approach) · [Issues I ran into](#issues-i-ran-into) ·
+[Assumptions](#assumptions) · [Possible improvements](#possible-improvements) ·
+[How to run](#how-to-run) · [How to verify](#how-to-verify) ·
+[How I worked](#how-i-worked) · [Two quick questions](#two-quick-questions)
 
 ## Summary
 
@@ -33,25 +39,6 @@ the application process.
 ## API
 
 ### `POST /bulk_payments`
-
-**Safe retries.** Send an optional `Idempotency-Key` header (1 to 255 visible ASCII
-characters, no spaces; a bad key is `400`) and a request that was executed is never
-executed again under that key
-([ADR 0003](docs/adr/0003-optional-idempotency-key.md)). Sending the same request again
-returns the original `201` and the same `payment_ids` with `Idempotent-Replayed: true`,
-and applies nothing. The same key with different content is `422`
-`idempotency_key_reused`. A key belongs to one payer. Without the header there is no
-protection: a client that times out and sends the same request again can pay everyone
-twice.
-
-"The same content" is the payer and the payments **in request order**, compared after
-parsing: `"300"` and `"300.00"` match, UUID case doesn't matter, descriptions match byte
-for byte. The same payments in another order are a different request, because the ids
-are positional.
-
-Every response carries an `X-Correlation-Id` header, and the service writes the same
-value on every log line for that request. Send your own (1 to 128 visible ASCII
-characters) and it is echoed; otherwise the service generates one.
 
 ```json
 {
@@ -107,7 +94,32 @@ deadlock) or `pool_exhausted` (no database connection became free in time).
 includes a balance, because the service has no authentication. See
 [ADR 0002](docs/adr/0002-malformed-400-denied-422.md).
 
-### Data model
+### Safe retries: `Idempotency-Key`
+
+Send an optional `Idempotency-Key` header (1 to 255 visible ASCII characters, no spaces;
+a bad key is `400`) and a request that was executed is never executed again under that
+key ([ADR 0003](docs/adr/0003-optional-idempotency-key.md)):
+
+- the same request again returns the original `201` and the same `payment_ids` with
+  `Idempotent-Replayed: true`, and applies nothing;
+- the same key with different content is `422` `idempotency_key_reused`;
+- a key belongs to one payer.
+
+Without the header there is no protection: a client that times out and sends the same
+request again can pay everyone twice.
+
+"The same content" is the payer and the payments **in request order**, compared after
+parsing: `"300"` and `"300.00"` match, UUID case doesn't matter, descriptions match byte
+for byte. The same payments in another order are a different request, because the ids
+are positional.
+
+### Correlation id
+
+Every response carries an `X-Correlation-Id` header, and the service writes the same
+value on every log line for that request. Send your own (1 to 128 visible ASCII
+characters) and it is echoed; otherwise the service generates one.
+
+## Data model
 
 The brief gives this schema:
 
@@ -172,7 +184,8 @@ All of the money logic sits in one function that holds one transaction
    ones are replaced before a request uses them, not one failed request each. That check
    happens before anything is sent, so it is safe. A connection lost *during* a
    transaction is deliberately not retried or mapped to `503`: after `COMMIT` the payment
-   may have been applied, and only a client that sent an `Idempotency-Key` can retry it safely. It stays a `500`.
+   may have been applied, and only a client that sent an `Idempotency-Key` can retry it
+   safely. It stays a `500`.
 7. **Correlation.** A middleware echoes a usable `X-Correlation-Id` or generates one, and
    a log record factory stamps it on every line, including the access line the app writes
    itself (uvicorn's access log is off).
@@ -325,7 +338,12 @@ make sample    # sends the request below, then prints the balances
 ```
 
 The script is [`scripts/sample-request.sh`](scripts/sample-request.sh); extra arguments
-go to `curl`, for example `scripts/sample-request.sh http://localhost:8000 -H 'X-Correlation-Id: sample-1'`.
+go to `curl`:
+
+```bash
+scripts/sample-request.sh http://localhost:8000 -H 'X-Correlation-Id: sample-1'
+```
+
 The same request by hand:
 
 ```bash
@@ -393,21 +411,30 @@ make verify-full   # make verify, then the two parts below
 
 The brief asks for the commit history and the AI tool usage.
 
-- **Commit history:** kept as it was made. No squashing.
-- **AI tools:**
-  - **Claude Code**: planning, implementation, review and QA through the
-    [agent-orchestration](https://github.com/TeleginS/agent-orchestration) pipeline
-    (vendored as `agent-orchestration/`; setup in [AGENTS.md](AGENTS.md)).
-  - _Others: TBD._
-- **Raw AI conversation logs:** `docs/ai-logs/` _(TBD)_. These are unedited, as the
-  brief requires.
+- **Commit history:** kept as it was made. No squashing. Each feature landed through a
+  pull request.
+- **AI tool:** Claude Code (desktop app) was the only one. It fit in at every step:
+  grilling the brief into the glossary and ADRs, setting up the tooling, then planning,
+  implementation, review and QA through the
+  [agent-orchestration](https://github.com/TeleginS/agent-orchestration) pipeline
+  (vendored as `agent-orchestration/`; setup in [AGENTS.md](AGENTS.md)).
+- **Raw AI conversation logs** in [`docs/ai-logs/`](docs/ai-logs/), one per session,
+  exported by script and not edited (each file's header lists its few redactions, such as
+  e-mail addresses):
+
+  | Log | Session |
+  |---|---|
+  | [`00-init-session.md`](docs/ai-logs/00-init-session.md) | Agent skills and repo setup |
+  | [`01-planning-session.md`](docs/ai-logs/01-planning-session.md) | Grilling the brief: glossary and ADRs 0001 to 0003 |
+  | [`02-tooling-setup.md`](docs/ai-logs/02-tooling-setup.md) | Docker, Makefile, seed |
+  | [`03-bulk-payments.md`](docs/ai-logs/03-bulk-payments.md) | The `POST /bulk_payments` endpoint |
+  | [`04-idempotency-key.md`](docs/ai-logs/04-idempotency-key.md) | Implementing the optional `Idempotency-Key` (ADR 0003) |
+  | [`05-readme-polish.md`](docs/ai-logs/05-readme-polish.md) | Polishing this README |
 
 ---
 
 ## Two quick questions
 
-**How much time did you spend on this task?**
-_TBD: less than 3h / 3h to 6h / more than 6h (how long?)_
+**How much time did you spend on this task?** Less than 3h.
 
-**How proud are you of your work?**
-_TBD: very proud / fairly proud / good enough / somewhat disappointed_
+**How proud are you of your work?** Good enough.
